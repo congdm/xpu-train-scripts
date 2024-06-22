@@ -6,7 +6,7 @@ import intel_extension_for_pytorch as ipex
 from diffusers.models.transformers import HunyuanDiT2DModel
 from diffusers import HunyuanDiTPipeline
 import diffusers.utils.peft_utils as peft_utils
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model, LoKrConfig
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
@@ -63,7 +63,9 @@ freqs_cis_img = init_image_posemb(
     log_fn=print,
     rope_real=True,
 )
+print('')
 if args.pipeline == 'HunyuanPipeline':
+    print('Use Hunyuan GaussianDiffusion training pipeline.')
     diffusion = create_diffusion(
         noise_schedule=args.noise_schedule,
         predict_type=args.predict_type,
@@ -77,24 +79,31 @@ else:
     from kohya_pipeline import PipelineHunyuan
     kohyaPipe = PipelineHunyuan()
 
-assert args.training_parts == "lora"
-if (args.resume is not None) and (args.resume != ''):
-    print(f'Resume training from {args.resume}')
-    model2 = HunyuanDiT2DModel.from_pretrained(
-        diffusers_pipe_name, subfolder='transformer', cache_dir=diffusers_cache_path
-    )
-    model2 = PeftModel.from_pretrained(model2, args.resume)
-    model2 = model2.merge_and_unload(progressbar=True, safe_merge=True)
-    model.load_state_dict(model2.state_dict())
-    del model2
-
-loraconfig = LoraConfig(
-    r=args.rank,
-    lora_alpha=args.rank,
-    target_modules=args.target_modules,
-    use_dora=args.use_dora,
-)
-model = get_peft_model(model, loraconfig)
+if args.training_parts == "lora":
+    if (args.resume is not None) and (args.resume != ''):
+        print(f'Resume training from {args.resume}')
+        model = PeftModel.from_pretrained(model, args.resume, is_trainable=True)
+    else:
+        loraconfig = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.rank,
+            target_modules=args.target_modules,
+            use_dora=args.use_dora,
+        )
+        model = get_peft_model(model, loraconfig)
+elif args.training_parts == "lokr":
+    if (args.resume is not None) and (args.resume != ''):
+        print(f'Resume training from {args.resume}')
+        model = PeftModel.from_pretrained(model, args.resume, is_trainable=True)
+    else:
+        loraconfig = LoKrConfig(
+            r=args.rank,
+            alpha=args.rank,
+            target_modules=args.target_modules,
+        )
+        model = get_peft_model(model, loraconfig)
+else:
+    assert False, 'Invalid training parts parameter. Must be lora or lokr.'
 
 ####################
 ####################
@@ -161,8 +170,10 @@ latents_dtype = args.latents_dtype
 inputs_dtype = args.inputs_dtype
 models_dtype = args.models_dtype
 
-print('')
-print(f"Training LoRA: rank {args.rank}; use DoRA = {args.use_dora}")
+if args.training_parts == 'lora':
+    print(f"Training LoRA: rank {args.rank}; use DoRA = {args.use_dora}")
+elif args.training_parts == 'lokr':
+    print(f"Training LoKr: rank {args.rank}")
 print(f'Model dtype: {models_dtype}')
 
 # print(f"AdamW Optimizer parameters: lr={args.lr}, weight_decay={args.weight_decay}")
@@ -227,7 +238,7 @@ for epoch in range(args.epochs):
 
         start_time = [time.time()]
         if args.pipeline == 'HunyuanPipeline':
-            loss_dict = diffusion.training_losses(model, latents, model_kwargs)
+            loss_dict = diffusion.training_losses(model, None, latents, model_kwargs)
             loss = loss_dict["loss"].mean() / args.grad_accu_steps
         elif args.pipeline == 'KohyaPipeline':
             loss = kohyaPipe.training_loss(model, latents, model_kwargs)
@@ -243,7 +254,8 @@ for epoch in range(args.epochs):
         running_loss += loss.item()
         if (step % args.grad_accu_steps == 0) or (step == data.num_batches):
             #log_gradients_in_model(model, writer, train_steps * args.batch_size)
-            #torch.nn.utils.clip_grad_value_(model.parameters(), 1.0)
+            if running_loss > 1.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad()
             diff = log_running_time(writer, start_time, 'optimizer time', train_steps * args.batch_size)

@@ -12,7 +12,6 @@ class args:
 
     resume = None #'./lora_1718818657/SakumaMayu2_0003'
     strict = True
-    training_parts = 'lora'
     lr = 1e-4
     weight_decay = 0.01
     epochs = 128
@@ -62,7 +61,8 @@ class args:
     ip_noise_gamma_random_strength = None
 
     # Lora param
-    rank = 8
+    training_parts = 'lokr' # lora, lokr
+    rank = 4
     #target_modules = ['Wqkv', 'q_proj', 'kv_proj', 'out_proj']
     target_modules = ['time_extra_emb.pooler.q_proj', 'to_q', 'to_k', 'to_v', 'to_out.0']
     use_dora = True
