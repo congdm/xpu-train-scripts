@@ -8,6 +8,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 from config import args
+import florence
 device = args.device
 
 def resize_image(image, origin_size, target_size):
@@ -66,6 +67,7 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             h = int(h)
             self.ratio_list.append(w/h)
             self.buckets[str(reso)] = []
+        self.empty_str_item = Item()
 
     def _find_nearest_reso(self, image_size):
         w = image_size[0]
@@ -85,7 +87,7 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         h = int(h)
         return (w, h), reso
 
-    def _process_item(self, image, text, danbooru_tags = None):
+    def _process_item(self, image, text, danbooru_tags = None, florenceCaption=None):
         original_size = image.size
         target_size, reso = self._find_nearest_reso(original_size)
         if target_size != original_size:
@@ -96,46 +98,57 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         item.original_size = original_size
         item.target_size = target_size
 
-        item.text = text
-        item.text_t5 = text
-        if danbooru_tags is not None:
-            item.text = item.text + '. danbooru tag: ' + danbooru_tags
-            item.text_t5 = item.text_t5 + '. danbooru tag: ' + danbooru_tags
+        if florenceCaption is None:
+            item.text = text
+            item.text_t5 = text
+            if danbooru_tags is not None:
+                item.text = item.text + '. danbooru tag: ' + danbooru_tags
+                item.text_t5 = item.text_t5 + '. danbooru tag: ' + danbooru_tags
+        else:
+            florenceText = florenceCaption.get_caption_for(image, detail_level=2)
+            item.text = text + '. ' + florenceText
+            item.text_t5 = text + '. ' + florenceText
         
         self.buckets[reso].append(item)
 
     @torch.no_grad()
-    def load_from_hf_dataset(self, hf_dataset, image_field='image', text_field='text'):
+    def load_from_hf_dataset(self, hf_dataset, image_field='image', text_field='text', use_florence=False):
         print(f'Processing dataset {hf_dataset}...')
         dataset = load_dataset(hf_dataset, split="train")
+        if use_florence:
+            florenceCaption = florence.FlorenceCaption()
         for x in tqdm(dataset):
-            self._process_item(x[image_field], x[text_field])
-
+            self._process_item(x[image_field], x[text_field], florenceCaption=florenceCaption)
         hf_dataset = hf_dataset.replace('/', '_')
         self.save_to_pt(hf_dataset)
 
     @torch.no_grad()
-    def load_from_waifuc_local(self, dataset_dir, dataset_name, prompt_prefix, pruned_tags=[]):
+    def load_from_waifuc_local(self, dataset_dir, dataset_name, prompt_prefix, pruned_tags=[], use_florence=False):
         print(f'Processing dataset {dataset_name}...')
         from waifuc.source import LocalSource
         from waifuc.action import ModeConvertAction
         source = LocalSource(dataset_dir)
         source = source.attach(
             ModeConvertAction(mode='RGB', force_background='white'),
-        )
-        danbooru_tags = ''
+        )      
+        if use_florence:
+            florenceCaption = florence.FlorenceCaption()
+            danbooru_tags = None
+        else:
+            danbooru_tags = ''
         for item in source:
             text = f'{prompt_prefix}'
-            if len(item.meta['tags']) > 0:
-                tags = item.meta['tags']
-                for k in tags.keys():
-                    #if (tags[k] >= 0.5) and (k not in pruned_tags): text = text + ' ' + k
-                    if k not in pruned_tags: danbooru_tags = danbooru_tags + k + ','
-            if danbooru_tags != '':
-                danbooru_tags = danbooru_tags.rstrip(',')
-            else:
-                danbooru_tags = None
-            self._process_item(item.image, text, danbooru_tags)
+            if not use_florence:
+                if len(item.meta['tags']) > 0:
+                    tags = item.meta['tags']
+                    for k in tags.keys():
+                        #if (tags[k] >= 0.5) and (k not in pruned_tags): text = text + ' ' + k
+                        if k not in pruned_tags: danbooru_tags = danbooru_tags + k + ','
+                if danbooru_tags != '':
+                    danbooru_tags = danbooru_tags.rstrip(',')
+                else:
+                    danbooru_tags = None
+            self._process_item(item.image, text, danbooru_tags, florenceCaption)
         self.save_to_pt(dataset_name)
 
     @torch.no_grad()
@@ -260,6 +273,9 @@ class DatasetHunyuan(torch.utils.data.Dataset):
                 for item in bucket:
                     self._encode_text_embeds_item(item)
                     pbar.update(1)
+        self.empty_str_item.text = ''
+        self.empty_str_item.text_t5 = ''
+        self._encode_text_embeds_item(self.empty_str_item)
         text_encoder.cpu()
         text_encoder_t5.cpu()
         del self.text_encoder
@@ -341,9 +357,21 @@ class DatasetHunyuan(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         reso, idx = self.batch_list[idx]
+        if random.random() < args.uncond_p:
+            encoder_hidden_states = self.empty_str_item.encoder_hidden_states
+            text_embedding_mask = self.empty_str_item.text_embedding_mask
+        else:
+            encoder_hidden_states = self.buckets[reso][idx].encoder_hidden_states
+            text_embedding_mask = self.buckets[reso][idx].text_embedding_mask
+        if random.random() < args.uncond_p_t5:
+            encoder_hidden_states_t5 = self.empty_str_item.encoder_hidden_states_t5
+            text_embedding_mask_t5 = self.empty_str_item.text_embedding_mask_t5
+        else:
+            encoder_hidden_states_t5 = self.buckets[reso][idx].encoder_hidden_states_t5
+            text_embedding_mask_t5 = self.buckets[reso][idx].text_embedding_mask_t5
         return (
             self.buckets[reso][idx].latents,
-            self.buckets[reso][idx].encoder_hidden_states, self.buckets[reso][idx].text_embedding_mask,
-            self.buckets[reso][idx].encoder_hidden_states_t5, self.buckets[reso][idx].text_embedding_mask_t5,
+            encoder_hidden_states, text_embedding_mask,
+            encoder_hidden_states_t5, text_embedding_mask_t5,
             self.buckets[reso][idx].image_meta_size,
         )

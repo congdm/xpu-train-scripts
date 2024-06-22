@@ -25,7 +25,7 @@ diffusers_pipe_name = args.diffusers_pipe_name
 
 ########################################
 # Lora output name
-LORA_NAME = 'Mayu'
+LORA_NAME = 'Mayu_LoKr'
 
 # Load and preprocess dataset
 ##############################
@@ -41,11 +41,12 @@ else:
     if args.dataset_type == 'WAIFUC_LOCAL':
         data.load_from_waifuc_local(
             args.dataset_localdir, args.dataset_name,
-            'Sakuma Mayu from THE iDOLM@STER Cinderella Girls', # prefix prompt
+            'Sakuma Mayu from iDOLM@STER Cinderella Girls', # prefix prompt
             [], # pruned tags
+            args.use_florence_caption,
         )
     else:
-        data.load_from_hf_dataset(args.dataset_name)
+        data.load_from_hf_dataset(args.dataset_name, use_florence=args.use_florence_caption)
 print('Done!')
 
 
