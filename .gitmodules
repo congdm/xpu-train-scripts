@@ -1,0 +1,3 @@
+[submodule "HunyuanDiT"]
+	path = HunyuanDiT
+	url = https://github.com/Tencent/HunyuanDiT
