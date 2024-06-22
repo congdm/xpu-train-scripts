@@ -38,5 +38,6 @@ class FlorenceCaption:
         parsed_answer = self.processor.post_process_generation(
             generated_text, task=prompt, image_size=(image.width, image.height)
         )
-        print(parsed_answer)
+        parsed_answer = parsed_answer[prompt]
+        # print(parsed_answer)
         return parsed_answer
