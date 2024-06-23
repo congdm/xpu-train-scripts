@@ -10,6 +10,9 @@ class args:
     dataset_localdir = './mayu_dataset-raw'
     load_dataset_from_cached_files = False
     use_florence_caption = True
+    florence_use_cpu = True # running florence on XPU can give garbaged results
+    florence_batch_size = 4
+    florence_print_to_screen = False    # print to screen to check results during processing
 
     resume = None #'./lora_1718818657/SakumaMayu2_0003'
     strict = True

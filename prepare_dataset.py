@@ -38,6 +38,7 @@ def random_crop_image(image, target_size):
 class Item:
     def __init__(self):
         self.image = None
+        self.filename = None
         self.text = None
         self.text_t5 = None
         self.original_size = None
@@ -87,7 +88,8 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         h = int(h)
         return (w, h), reso
 
-    def _process_item(self, image, text, danbooru_tags = None, florenceCaption=None):
+    @torch.no_grad()
+    def _process_item(self, image, text, danbooru_tags = None):
         original_size = image.size
         target_size, reso = self._find_nearest_reso(original_size)
         if target_size != original_size:
@@ -97,28 +99,25 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         item.image = image
         item.original_size = original_size
         item.target_size = target_size
-
-        if florenceCaption is None:
-            item.text = text
-            item.text_t5 = text
-            if danbooru_tags is not None:
-                item.text = item.text + '. danbooru tag: ' + danbooru_tags
-                item.text_t5 = item.text_t5 + '. danbooru tag: ' + danbooru_tags
-        else:
-            florenceText = florenceCaption.get_caption_for(image, detail_level=2)
-            item.text = text + '. ' + florenceText
-            item.text_t5 = text + '. ' + florenceText
-        
+        item.text = text
+        item.text_t5 = text
+        if danbooru_tags is not None:
+            item.text = item.text + '. danbooru tag: ' + danbooru_tags
+            item.text_t5 = item.text_t5 + '. danbooru tag: ' + danbooru_tags
         self.buckets[reso].append(item)
+        return item
 
     @torch.no_grad()
     def load_from_hf_dataset(self, hf_dataset, image_field='image', text_field='text', use_florence=False):
         print(f'Processing dataset {hf_dataset}...')
         dataset = load_dataset(hf_dataset, split="train")
-        if use_florence:
-            florenceCaption = florence.FlorenceCaption()
+        idx = 0
         for x in tqdm(dataset):
-            self._process_item(x[image_field], x[text_field], florenceCaption=florenceCaption)
+            item = self._process_item(x[image_field], x[text_field])
+            item.filename = f'idx {idx}'
+            idx = idx+1
+        if use_florence:
+            self._create_florence_captions()
         hf_dataset = hf_dataset.replace('/', '_')
         self.save_to_pt(hf_dataset)
 
@@ -130,15 +129,11 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         source = LocalSource(dataset_dir)
         source = source.attach(
             ModeConvertAction(mode='RGB', force_background='white'),
-        )      
-        if use_florence:
-            florenceCaption = florence.FlorenceCaption()
-            danbooru_tags = None
-        else:
-            danbooru_tags = ''
+        ) 
         for item in source:
             text = f'{prompt_prefix}'
             if not use_florence:
+                danbooru_tags = ''
                 if len(item.meta['tags']) > 0:
                     tags = item.meta['tags']
                     for k in tags.keys():
@@ -148,11 +143,57 @@ class DatasetHunyuan(torch.utils.data.Dataset):
                     danbooru_tags = danbooru_tags.rstrip(',')
                 else:
                     danbooru_tags = None
-            self._process_item(item.image, text, danbooru_tags, florenceCaption)
+            else:
+                danbooru_tags = None
+            self_item = self._process_item(item.image, text, danbooru_tags)
+            self_item.filename = item.meta['filename']
+        if use_florence:
+            self._create_florence_captions()
         self.save_to_pt(dataset_name)
+
+    def _create_florence_captions(self):
+        def _process_batch(florenceCaption, batch, batch_items):
+            results = florenceCaption.get_caption_for(batch, detail_level=2)
+            for i in range(len(results)):
+                batch_items[i].text = batch_items[i].text + '. ' + results[i]
+                batch_items[i].text_t5 = batch_items[i].text_t5 + '. ' + results[i]
+                if args.florence_print_to_screen:
+                    print('')
+                    print(batch_items[i].filename)
+                    print(results[i])
+        print('Creating captions for dataset with Florence...')
+        if args.florence_use_cpu:
+            florenceCaption = florence.FlorenceCaption('cpu')
+        else:
+            florenceCaption = florence.FlorenceCaption(args.device)
+        with tqdm(total=self.__len__()) as pbar:
+            for reso in self.buckets:
+                batch = []
+                batch_items = []
+                batch_size = args.florence_batch_size
+                for item in self.buckets[reso]:
+                    if len(batch) >= batch_size:
+                        _process_batch(florenceCaption, batch, batch_items)
+                        pbar.update(len(batch))
+                        batch = []
+                        batch_items = []
+                    batch_items.append(item)
+                    batch.append(item.image)
+                if len(batch) > 0:
+                    _process_batch(florenceCaption, batch, batch_items)
+                    pbar.update(len(batch))
+
+    def _print_captions_to_file(self, prefix):
+        with open(f'{prefix}_captions.txt', 'w') as f:
+            for reso in self.buckets:
+                for item in self.buckets[reso]:
+                    print(item.filename, file=f)
+                    print(item.text, file=f)
+                    print('', file=f)
 
     @torch.no_grad()
     def save_to_pt(self, prefix):
+        self._print_captions_to_file(prefix)
         torch.save(self.buckets, f'{prefix}_cached.pt')
 
     @torch.no_grad()
