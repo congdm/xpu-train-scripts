@@ -8,6 +8,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 from config import args
+from config import dataset_args
 import florence
 device = args.device
 
@@ -69,6 +70,17 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             self.ratio_list.append(w/h)
             self.buckets[str(reso)] = []
         self.empty_str_item = Item()
+        if args.random_flip:
+            self.flip_norm = transforms.Compose([
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5], [0.5]),
+            ])
+        else:
+            self.flip_norm = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5], [0.5]),
+            ])
 
     def _find_nearest_reso(self, image_size):
         w = image_size[0]
@@ -102,8 +114,8 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         item.text = text
         item.text_t5 = text
         if danbooru_tags is not None:
-            item.text = item.text + '. danbooru tag: ' + danbooru_tags
-            item.text_t5 = item.text_t5 + '. danbooru tag: ' + danbooru_tags
+            item.text = item.text + ' ' + danbooru_tags
+            item.text_t5 = item.text_t5 + ' ' + danbooru_tags
         self.buckets[reso].append(item)
         return item
 
@@ -137,11 +149,10 @@ class DatasetHunyuan(torch.utils.data.Dataset):
                 if len(item.meta['tags']) > 0:
                     tags = item.meta['tags']
                     for k in tags.keys():
-                        #if (tags[k] >= 0.5) and (k not in pruned_tags): text = text + ' ' + k
-                        if k not in pruned_tags: danbooru_tags = danbooru_tags + k + ','
-                if danbooru_tags != '':
-                    danbooru_tags = danbooru_tags.rstrip(',')
-                else:
+                        if tags[k] >= dataset_args.waifuc_tags_threshold:
+                            if k not in dataset_args.waifuc_pruned_tags:
+                                danbooru_tags = danbooru_tags + k + ' '
+                if danbooru_tags == '':
                     danbooru_tags = None
             else:
                 danbooru_tags = None
@@ -157,12 +168,12 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             for i in range(len(results)):
                 batch_items[i].text = batch_items[i].text + '. ' + results[i]
                 batch_items[i].text_t5 = batch_items[i].text_t5 + '. ' + results[i]
-                if args.florence_print_to_screen:
+                if dataset_args.florence_print_to_screen:
                     print('')
                     print(batch_items[i].filename)
                     print(results[i])
         print('Creating captions for dataset with Florence...')
-        if args.florence_use_cpu:
+        if dataset_args.florence_use_cpu:
             florenceCaption = florence.FlorenceCaption('cpu')
         else:
             florenceCaption = florence.FlorenceCaption(args.device)
@@ -170,7 +181,7 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             for reso in self.buckets:
                 batch = []
                 batch_items = []
-                batch_size = args.florence_batch_size
+                batch_size = dataset_args.florence_batch_size
                 for item in self.buckets[reso]:
                     if len(batch) >= batch_size:
                         _process_batch(florenceCaption, batch, batch_items)
@@ -193,11 +204,15 @@ class DatasetHunyuan(torch.utils.data.Dataset):
 
     @torch.no_grad()
     def save_to_pt(self, prefix):
+        if dataset_args.use_florence_caption:
+            prefix = prefix + '_florence'
         self._print_captions_to_file(prefix)
         torch.save(self.buckets, f'{prefix}_cached.pt')
 
     @torch.no_grad()
     def load_from_pt(self, prefix):
+        if dataset_args.use_florence_caption:
+            prefix = prefix + '_florence'
         self.buckets = torch.load(f'{prefix}_cached.pt')
 
     @torch.no_grad()
@@ -246,9 +261,8 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         else:
             image = item.image
             crops_coords_top_left = (0, 0)
-        image = transforms.ToTensor()(image)
-        image = image.unsqueeze(0) * 2.0 - 1.0
-        image = image.to(device=device, dtype=args.latents_dtype)
+        image = self.flip_norm(image)
+        image = image.unsqueeze(0).to(device=device, dtype=torch.float16)
         vae_scaling_factor = vae.config.scaling_factor
         latents = vae.encode(image).latent_dist.sample().mul_(vae_scaling_factor)
         item.latents = latents.cpu().squeeze(0)
@@ -264,7 +278,8 @@ class DatasetHunyuan(torch.utils.data.Dataset):
     
     @torch.no_grad()
     def encode_latents(self, vae):
-        vae.to(device=device, dtype=args.latents_dtype)
+        # vae.to(device=device, dtype=args.latents_dtype)
+        vae.to(device=device, dtype=torch.float16)
         with tqdm(total=self.__len__()) as pbar:
             for reso in self.buckets:
                 bucket = self.buckets[reso]

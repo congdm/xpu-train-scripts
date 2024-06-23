@@ -15,6 +15,7 @@ from transformers.optimization import Adafactor, AdafactorSchedule
 import hijack_hunyuan_training
 from config import args
 from prepare_dataset import DatasetHunyuan
+import utils
 
 from HunyuanDiT.hydit.modules.posemb_layers import init_image_posemb
 from HunyuanDiT.hydit.diffusion import create_diffusion
@@ -30,25 +31,7 @@ LORA_NAME = 'Mayu_LoKr'
 # Load and preprocess dataset
 ##############################
 data = DatasetHunyuan()
-print('\nLoad and process training data.')
-if args.load_dataset_from_cached_files:
-    print('Load cached latents...')
-    if args.dataset_type == 'WAIFUC_LOCAL':
-        data.load_from_pt(args.dataset_name)
-    else:
-        data.load_from_pt(args.dataset_name.replace('/','_'))
-else:
-    if args.dataset_type == 'WAIFUC_LOCAL':
-        data.load_from_waifuc_local(
-            args.dataset_localdir, args.dataset_name,
-            'Sakuma Mayu from iDOLM@STER Cinderella Girls', # prefix prompt
-            [], # pruned tags
-            args.use_florence_caption,
-        )
-    else:
-        data.load_from_hf_dataset(args.dataset_name, use_florence=args.use_florence_caption)
-print('Done!')
-
+utils.load_dataset_hunyuan(data)
 
 # Training model
 ################################
@@ -80,29 +63,27 @@ else:
     from kohya_pipeline import PipelineHunyuan
     kohyaPipe = PipelineHunyuan()
 
-if args.training_parts == "lora":
-    if (args.resume is not None) and (args.resume != ''):
-        print(f'Resume training from {args.resume}')
-        model = PeftModel.from_pretrained(model, args.resume, is_trainable=True)
-    else:
-        loraconfig = LoraConfig(
-            r=args.rank,
-            lora_alpha=args.rank,
-            target_modules=args.target_modules,
-            use_dora=args.use_dora,
-        )
-        model = get_peft_model(model, loraconfig)
+if (args.resume is not None) and (args.resume != ''):
+    print(f'Resume training from {args.resume}')
+    model = PeftModel.from_pretrained(model, args.resume, is_trainable=True)
+    opt_dict = torch.load(f'{args.resume}/optimizer.pt')
+elif args.training_parts == "lora":
+    loraconfig = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.alpha,
+        target_modules=args.target_modules,
+        use_dora=args.use_dora,
+    )
+    model = get_peft_model(model, loraconfig)
 elif args.training_parts == "lokr":
-    if (args.resume is not None) and (args.resume != ''):
-        print(f'Resume training from {args.resume}')
-        model = PeftModel.from_pretrained(model, args.resume, is_trainable=True)
-    else:
-        loraconfig = LoKrConfig(
-            r=args.rank,
-            alpha=args.rank,
-            target_modules=args.target_modules,
-        )
-        model = get_peft_model(model, loraconfig)
+    loraconfig = LoKrConfig(
+        r=args.rank,
+        alpha=args.alpha,
+        target_modules=args.target_modules,
+        decompose_both=args.lokr_decompose_both,
+        use_effective_conv2d=args.lokr_use_effective_conv2d,
+    )
+    model = get_peft_model(model, loraconfig)
 else:
     assert False, 'Invalid training parts parameter. Must be lora or lokr.'
 
@@ -170,33 +151,7 @@ def log_gradients_in_model(model, writer, step):
 latents_dtype = args.latents_dtype
 inputs_dtype = args.inputs_dtype
 models_dtype = args.models_dtype
-
-if args.training_parts == 'lora':
-    print(f"Training LoRA: rank {args.rank}; use DoRA = {args.use_dora}")
-elif args.training_parts == 'lokr':
-    print(f"Training LoKr: rank {args.rank}")
-print(f'Model dtype: {models_dtype}')
-
-# print(f"AdamW Optimizer parameters: lr={args.lr}, weight_decay={args.weight_decay}")
-# opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, eps=1e-4)
-
-# print(f'Using Adafactor optimizer with parameters: lr={args.lr}, weight_decay={args.weight_decay}')
-# opt = Adafactor(model.parameters(), scale_parameter=True, relative_step=False, warmup_init=False, lr=args.lr, weight_decay=args.weight_decay)
-# scheduler = torch.optim.lr_scheduler.CyclicLR(opt, args.lr, args.lr*10, step_size_up=250, cycle_momentum=False)
-
-# print('Using Adafactor optimizer with time-dependent lr.')
-# opt = Adafactor(model.parameters(), scale_parameter=True, relative_step=True, warmup_init=True, lr=None)
-
-# print(f'Using Prodigy optimizer with weight_decay = {args.weight_decay}')
-# opt = Prodigy(model.parameters(), lr=1, weight_decay=args.weight_decay, safeguard_warmup=True)
-
-print(f"SGD Nesterov Optimizer parameters: lr={args.lr}, momentum={0.9}, weight_decay={args.weight_decay}")
-opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=True)
-
-# print(f"SGD Optimizer parameters: lr={args.lr}")
-# opt = torch.optim.SGD(model.parameters(), lr=args.lr)
-# scheduler = torch.optim.lr_scheduler.CyclicLR(opt, args.lr, args.lr*10*2, step_size_up=250, cycle_momentum=False)
-
+    
 data.organize_into_batches()
 print('Training buckets: ')
 data.print_buckets_info()
@@ -214,22 +169,37 @@ gc.collect()
 torch.xpu.empty_cache()
 
 model.to(device=device, dtype=models_dtype)
-model.train()
-if models_dtype == torch.float32:
-    model, opt = torch.xpu.optimize(model, optimizer=opt, fuse_update_step=True)
-elif models_dtype == torch.bfloat16:
-    model, opt = torch.xpu.optimize(model, optimizer=opt, dtype=models_dtype)
+if args.resume is None or args.resume == '':
+    if args.training_parts == 'lora':
+        print(f"Training LoRA: rank {args.rank}; alpha {args.alpha}; use DoRA: {args.use_dora}")
+    elif args.training_parts == 'lokr':
+        print(f"Training LoKr: rank {args.rank}; alpha {args.alpha}")
+
+    print(f'Model dtype: {models_dtype}')
+    opt = utils.create_optimizer(args.optimizer, model)
+    if models_dtype == torch.float32:
+        model, opt = torch.xpu.optimize(model, optimizer=opt, fuse_update_step=True)
+    elif models_dtype == torch.bfloat16:
+        model, opt = torch.xpu.optimize(model, optimizer=opt, dtype=models_dtype)
+    start_epoch = 0
+    train_steps = 0
+else:
+    opt = utils.create_optimizer(args.optimizer, model, verbose=False)
+    opt.load_state_dict(opt_dict['state_dict'])
+    print('Loaded optimizer state dict')
+    start_epoch = opt_dict['epoch']+1
+    train_steps = opt_dict['train_steps']
 
 writer = SummaryWriter()
 timestamp = time.time()
-train_steps = 0
-running_loss = 0.0
 torch.xpu.reset_accumulated_memory_stats()
+model.train()
 # Training loop
-for epoch in range(args.epochs):
+for epoch in range(start_epoch, args.epochs):
     print(f"Beginning epoch {epoch+1}...")
     data.shuffle()
     step = 0
+    running_loss = 0.0
     for batch in tqdm(data_loader, miniters=1):
         step += 1
         train_steps += 1
@@ -252,7 +222,9 @@ for epoch in range(args.epochs):
         log_running_time(writer, start_time, 'backward pass time', train_steps * args.batch_size)
         log_xpu_stats(writer, 'after backward pass', train_steps * args.batch_size)
 
-        running_loss += loss.item()
+        loss0 = loss.cpu()
+        loss0 = loss0.item()
+        running_loss += loss0
         if (step % args.grad_accu_steps == 0) or (step == data.num_batches):
             #log_gradients_in_model(model, writer, train_steps * args.batch_size)
             if running_loss > 1.0:
@@ -281,8 +253,10 @@ for epoch in range(args.epochs):
         model.save_pretrained(save_name)
         torch.save(
             {
-                'optimizer_class': opt.__class__.__qualname__,
+                'optimizer_class': args.optimizer,
                 'state_dict': opt.state_dict(),
+                'epoch': epoch,
+                'train_steps': train_steps,
             },
             save_name + '/optimizer.pt'
         )

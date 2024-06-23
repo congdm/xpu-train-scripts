@@ -1,30 +1,53 @@
+from enum import Enum
 import torch
+
+class DatasetType(Enum):
+    WAIFUC_LOCAL = 1
+    HUGGING_FACE = 2
+    IMG_AND_TXT_LOCAL = 3
+
+class opt_args:
+    # check utils.py for params used by optimizer
+    lr = 1e-3
+    weight_decay = 0.01
+    momentum=0.9
+    relative_step=True
+    scale_parameter=True
+    warmup_init=True
+
+class dataset_args:
+    type = DatasetType.WAIFUC_LOCAL
+    name = 'sakuma_mayu'
+    localdir = './mayu_dataset-raw' # if dataset is from local source
+    load_dataset_from_cached_files = False
+
+    waifuc_pruned_tags = [] # tags in this list will be removed from captions
+    waifuc_tags_threshold = 0.5 # tags with value < threshold will be removed from captions
+    waifuc_prefix_prompt = 'Sakuma Mayu from iDOLM@STER Cinderella Girls'
+
+    hf_image_field = 'image'    # name of image field in hugging face dataset
+    hf_text_field = 'text'
+
+    use_florence_caption = False
+    florence_use_cpu = True # running florence on XPU can give garbaged results
+    florence_batch_size = 4
+    florence_print_to_screen = False    # print to screen to check results during processing
 
 class args:
     device='xpu'
     diffusers_cache_path = '/Data/automatic/models/Diffusers'
     diffusers_pipe_name = 'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers'
 
-    dataset_type = 'WAIFUC_LOCAL'
-    dataset_name = 'sakuma_mayu'
-    dataset_localdir = './mayu_dataset-raw'
-    load_dataset_from_cached_files = False
-    use_florence_caption = True
-    florence_use_cpu = True # running florence on XPU can give garbaged results
-    florence_batch_size = 4
-    florence_print_to_screen = False    # print to screen to check results during processing
-
-    resume = None #'./lora_1718818657/SakumaMayu2_0003'
-    strict = True
-    lr = 1e-4
-    weight_decay = 0.01
+    resume = None #'./lora_1719158082/Mayu_LoKr_0001'
     epochs = 128
     grad_accu_steps = 2
     batch_size = 1
     ckpt_every_epoch = 1
     gradient_checkpointing = True
+    random_flip = True
     uncond_p = 0.44
     uncond_p_t5 = 0.44
+    optimizer = 'SGD' # check utils.py create_optimizer func for supported optimizers
 
     # Hunyuan Diffusion
     #model = 'DiT-g/2'
@@ -47,7 +70,7 @@ class args:
     mse_loss_weight_type = 'min_snr_5' # 'min_snr_5', 'constant'
     beta_start = 0.00085
     beta_end = 0.03
-    noise_offset = 0.1
+    noise_offset = 0.05
 
     # pipeline = 'KohyaPipeline'
     # noise_schedule = 'scaled_linear'
@@ -67,10 +90,13 @@ class args:
 
     # Lora param
     training_parts = 'lokr' # lora, lokr
-    rank = 4
+    rank = 8
+    alpha = 4
     #target_modules = ['Wqkv', 'q_proj', 'kv_proj', 'out_proj']
     target_modules = ['time_extra_emb.pooler.q_proj', 'to_q', 'to_k', 'to_v', 'to_out.0']
     use_dora = True
+    lokr_use_effective_conv2d = True
+    lokr_decompose_both = True
 
     ###
     latents_dtype = torch.float32
