@@ -95,21 +95,21 @@ def HunyuanDiT2DModel_forward(
     #hidden_states = hidden_states.to(dtype=torch.float16)
     #timestep = timestep.to(dtype=torch.float16)
     
-    if args.gradient_checkpointing:
-        for x in hidden_states:
-            x.requires_grad = True
-        for x in encoder_hidden_states_t5:
-            x.requires_grad = True
-        for x in encoder_hidden_states:
-            x.requires_grad = True
-        for x in image_meta_size:
-           x.requires_grad = True
-        timestep.requires_grad = True
+    # if args.gradient_checkpointing:
+    #     for x in hidden_states:
+    #         x.requires_grad = True
+    #     for x in encoder_hidden_states_t5:
+    #         x.requires_grad = True
+    #     for x in encoder_hidden_states:
+    #         x.requires_grad = True
+    #     for x in image_meta_size:
+    #        x.requires_grad = True
+    #     timestep.requires_grad = True
 
     height, width = hidden_states.shape[-2:]
 
     hidden_states = self.pos_embed(hidden_states)
-    
+
     temb = self.time_extra_emb(
         timestep, encoder_hidden_states_t5, image_meta_size, style, hidden_dtype=timestep.dtype
     )  # [B, D]
@@ -143,7 +143,7 @@ def HunyuanDiT2DModel_forward(
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     block,
                     hidden_states, encoder_hidden_states, temb, image_rotary_emb, skip,
-                    use_reentrant=True,
+                    use_reentrant=False,
                 )
         else:
             if not args.gradient_checkpointing:
@@ -157,7 +157,7 @@ def HunyuanDiT2DModel_forward(
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     block,
                     hidden_states, encoder_hidden_states, temb, image_rotary_emb,
-                    use_reentrant=True,
+                    use_reentrant=False,
                 )
 
         if layer < (self.config.num_layers // 2 - 1):
@@ -166,6 +166,7 @@ def HunyuanDiT2DModel_forward(
     # final layer
     hidden_states = self.norm_out(hidden_states, temb.to(torch.float32))
     hidden_states = self.proj_out(hidden_states)
+    # (N, L, patch_size ** 2 * out_channels)
 
     # unpatchify: (N, out_channels, H, W)
     patch_size = self.pos_embed.patch_size

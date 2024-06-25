@@ -1,4 +1,5 @@
 import time
+import random
 import gc
 
 import torch
@@ -14,7 +15,7 @@ from transformers.optimization import Adafactor, AdafactorSchedule
 
 import hijack_hunyuan_training
 from config import args
-from prepare_dataset import DatasetHunyuan
+from prepare_dataset import DatasetHunyuan, TrainingDatasetHunyuan, DataEncoderHunyuan
 import utils
 
 from HunyuanDiT.hydit.modules.posemb_layers import init_image_posemb
@@ -26,7 +27,8 @@ diffusers_pipe_name = args.diffusers_pipe_name
 
 ########################################
 # Lora output name
-LORA_NAME = 'Mayu_LoKr'
+LORA_NAME = 'Mayu'
+utils.parse_args()
 
 # Load and preprocess dataset
 ##############################
@@ -81,6 +83,7 @@ elif args.training_parts == "lokr":
         alpha=args.alpha,
         target_modules=args.target_modules,
         decompose_both=args.lokr_decompose_both,
+        decompose_factor=args.lokr_decompose_factor,
         use_effective_conv2d=args.lokr_use_effective_conv2d,
     )
     model = get_peft_model(model, loraconfig)
@@ -92,31 +95,35 @@ else:
     
 @torch.no_grad()
 def prepare_model_inputs(batch):
-    (
-        latents,
-        encoder_hidden_states, text_embedding_mask,
-        encoder_hidden_states_t5, text_embedding_mask_t5,
-        image_meta_size, #reso
-    ) = batch
-    latents = latents.to(device, dtype=latents_dtype)
+    if len(batch) > 1:
+        (
+            latents,
+            encoder_hidden_states, text_embedding_mask,
+            encoder_hidden_states_t5, text_embedding_mask_t5,
+            image_meta_size, #reso
+        ) = batch
+        latents = latents.to(device, dtype=latents_dtype)
 
-    style = torch.tensor([0], dtype=torch.int32)
-    style = style.repeat(args.batch_size)
+        style = torch.tensor([0], dtype=torch.int32)
+        style = style.repeat(args.batch_size)
 
-    # positional embedding
-    reso = f'{int(image_meta_size[0][2].item())}x{int(image_meta_size[0][3].item())}'
-    cos_cis_img, sin_cis_img = freqs_cis_img[reso]
+        # positional embedding
+        reso = f'{int(image_meta_size[0][2].item())}x{int(image_meta_size[0][3].item())}'
+        cos_cis_img, sin_cis_img = freqs_cis_img[reso]
 
-    # Model conditions
-    model_kwargs = dict(
-        encoder_hidden_states=encoder_hidden_states.to(device, dtype=inputs_dtype),
-        text_embedding_mask=text_embedding_mask.to(device),
-        encoder_hidden_states_t5=encoder_hidden_states_t5.to(device, dtype=inputs_dtype),
-        text_embedding_mask_t5=text_embedding_mask_t5.to(device),
-        image_meta_size=image_meta_size.to(device, dtype=inputs_dtype),
-        style=style.to(device),
-        image_rotary_emb=(cos_cis_img.to(device, dtype=inputs_dtype), sin_cis_img.to(device, dtype=inputs_dtype)),
-    )
+        # Model conditions
+        model_kwargs = dict(
+            encoder_hidden_states=encoder_hidden_states.to(device, dtype=inputs_dtype),
+            text_embedding_mask=text_embedding_mask.to(device),
+            encoder_hidden_states_t5=encoder_hidden_states_t5.to(device, dtype=inputs_dtype),
+            text_embedding_mask_t5=text_embedding_mask_t5.to(device),
+            image_meta_size=image_meta_size.to(device, dtype=inputs_dtype),
+            style=style.to(device),
+            image_rotary_emb=(cos_cis_img.to(device, dtype=inputs_dtype), sin_cis_img.to(device, dtype=inputs_dtype)),
+        )
+    else:
+        latents = None
+        model_kwargs = None
     return latents, model_kwargs
 
 def log_xpu_stats(writer, msg, step):
@@ -157,18 +164,13 @@ print('Training buckets: ')
 data.print_buckets_info()
 print('')
 assert args.batch_size == 1, 'currently only support batch_size=1'
-data_loader = DataLoader(data, batch_size=args.batch_size, shuffle=False)
-
-print('Encode images to latents...')
-data.encode_latents(pipe.vae)
-gc.collect()
-torch.xpu.empty_cache()
-print('Encode text embeds...')
-data.encode_text_embeds(pipe.text_encoder, pipe.tokenizer, pipe.text_encoder_2, pipe.tokenizer_2)
-gc.collect()
-torch.xpu.empty_cache()
+training_data = TrainingDatasetHunyuan(data)
+data_encoder = DataEncoderHunyuan(
+    pipe.vae, pipe.text_encoder, pipe.tokenizer, pipe.text_encoder_2, pipe.tokenizer_2
+)
 
 model.to(device=device, dtype=models_dtype)
+model.train()
 if args.resume is None or args.resume == '':
     if args.training_parts == 'lora':
         print(f"Training LoRA: rank {args.rank}; alpha {args.alpha}; use DoRA: {args.use_dora}")
@@ -177,10 +179,10 @@ if args.resume is None or args.resume == '':
 
     print(f'Model dtype: {models_dtype}')
     opt = utils.create_optimizer(args.optimizer, model)
-    if models_dtype == torch.float32:
-        model, opt = torch.xpu.optimize(model, optimizer=opt, fuse_update_step=True)
-    elif models_dtype == torch.bfloat16:
-        model, opt = torch.xpu.optimize(model, optimizer=opt, dtype=models_dtype)
+    # if models_dtype == torch.float32:
+    #     model, opt = torch.xpu.optimize(model, optimizer=opt, fuse_update_step=True)
+    # elif models_dtype == torch.bfloat16:
+    #     model, opt = torch.xpu.optimize(model, optimizer=opt, dtype=models_dtype)
     start_epoch = 0
     train_steps = 0
 else:
@@ -191,22 +193,26 @@ else:
     train_steps = opt_dict['train_steps']
 
 writer = SummaryWriter()
-timestamp = time.time()
 torch.xpu.reset_accumulated_memory_stats()
-model.train()
 # Training loop
 for epoch in range(start_epoch, args.epochs):
+    utils.training_prolog(epoch, training_data, data_encoder)
+    data_loader = DataLoader(training_data, batch_size=args.batch_size, shuffle=True)
+    gc.collect()
+    torch.xpu.empty_cache()
+
     print(f"Beginning epoch {epoch+1}...")
-    data.shuffle()
     step = 0
+    drop_count = 0
+    accu_steps = 0
     running_loss = 0.0
     for batch in tqdm(data_loader, miniters=1):
-        step += 1
         train_steps += 1
-        
-        #latents, model_kwargs = prepare_model_inputs(data.get_batch(batch_idx))
-        latents, model_kwargs = prepare_model_inputs(batch)
+        step += 1
+        accu_steps += 1
 
+        latents, model_kwargs = prepare_model_inputs(batch)
+          
         start_time = [time.time()]
         if args.pipeline == 'HunyuanPipeline':
             loss_dict = diffusion.training_losses(model, None, latents, model_kwargs)
@@ -222,34 +228,27 @@ for epoch in range(start_epoch, args.epochs):
         log_running_time(writer, start_time, 'backward pass time', train_steps * args.batch_size)
         log_xpu_stats(writer, 'after backward pass', train_steps * args.batch_size)
 
-        loss0 = loss.cpu()
-        loss0 = loss0.item()
-        running_loss += loss0
-        if (step % args.grad_accu_steps == 0) or (step == data.num_batches):
-            #log_gradients_in_model(model, writer, train_steps * args.batch_size)
-            if running_loss > 1.0:
+        running_loss += loss.item()
+        if accu_steps == args.grad_accu_steps or step == len(training_data):
+            running_loss = running_loss * args.grad_accu_steps / accu_steps
+            if running_loss > 2.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad()
-            diff = log_running_time(writer, start_time, 'optimizer time', train_steps * args.batch_size)
-            if diff > 10:
-                gc.collect()
-                torch.xpu.empty_cache()
             log_xpu_stats(writer, 'after optimizer step', train_steps * args.batch_size)
-
-            if step % args.grad_accu_steps != 0:
-                running_loss = running_loss * args.grad_accu_steps / (step % args.grad_accu_steps)
+            diff = log_running_time(writer, start_time, 'optimizer time', train_steps * args.batch_size)
             writer.add_scalar("Loss over train steps", running_loss, train_steps * args.batch_size)
             running_loss = 0.0
+            accu_steps = 0
         
         # scheduler.step()
         # writer.add_scalar("LR", scheduler.get_last_lr()[0], train_steps * args.batch_size)
         # writer.add_scalar("LR", opt.param_groups[0]['lr'], train_steps * args.batch_size)
 
-        check_xpu_reserved_memory(threshold=13e+9)
+        check_xpu_reserved_memory(threshold=13.5e+9)
 
     if (epoch+1) % args.ckpt_every_epoch == 0:
-        save_name = f'./lora_{int(timestamp)}/{LORA_NAME}_{epoch+1:04d}'
+        save_name = f'./{args.output_folder}/{LORA_NAME}_{args.training_parts}_{epoch+1:04d}'
         model.save_pretrained(save_name)
         torch.save(
             {
@@ -260,12 +259,8 @@ for epoch in range(start_epoch, args.epochs):
             },
             save_name + '/optimizer.pt'
         )
-    model.cpu()
-    print('Encode images to latents...')
-    data.encode_latents(pipe.vae)
     gc.collect()
     torch.xpu.empty_cache()
-    model.to(device=device)
 
 writer.close()
 

@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import transformers.optimization
 
@@ -12,6 +14,7 @@ def load_dataset_hunyuan(data):
                 config.dataset_args.localdir, config.dataset_args.name,
                 config.dataset_args.waifuc_prefix_prompt,
                 config.dataset_args.waifuc_pruned_tags,
+                config.dataset_args.waifuc_tags_threshold,
                 config.dataset_args.use_florence_caption,
             )
         elif config.dataset_args.type == config.DatasetType.HUGGING_FACE:
@@ -69,3 +72,35 @@ def create_optimizer(optimizer_name, model, verbose=True):
     else:
         assert False, 'not supported optimizer'
     return opt
+
+def training_prolog(epoch, dataset, encoder):
+    if epoch == 0:
+        uncond_p = args.uncond_p
+        uncond_p_t5 = args.uncond_p_t5
+        args.uncond_p = 1.1
+        args.uncond_p_t5 = 1.1
+    dataset.populate_samples()
+    print('Encode images to latents...')
+    dataset.encode_latents(encoder)
+    print('Encode text embeds...')
+    dataset.encode_text_embeds(encoder)
+    with open('debug.txt', 'a+') as f:
+        print(f'Epoch {epoch}', file=f)
+        for x in dataset._data[dataset._current]:
+            print(x.text, file=f)
+    if epoch == 0:
+        args.uncond_p = uncond_p
+        args.uncond_p_t5 = uncond_p_t5
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output-folder')
+    parser.add_argument('--resume')
+    args_ = parser.parse_args()
+
+    if args_.output_folder:
+        print(f'Set output folder to: {args_.output_folder}')
+        args.output_folder = args_.output_folder
+    if args_.resume:
+        args.resume = args_.resume
+        

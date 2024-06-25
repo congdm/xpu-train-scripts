@@ -1,4 +1,5 @@
 from enum import Enum
+import time
 import torch
 
 class DatasetType(Enum):
@@ -8,10 +9,10 @@ class DatasetType(Enum):
 
 class opt_args:
     # check utils.py for params used by optimizer
-    lr = 1e-3
-    weight_decay = 0.01
+    lr = 5e-5
+    weight_decay = 0.0
     momentum=0.9
-    relative_step=True
+    relative_step=False
     scale_parameter=True
     warmup_init=True
 
@@ -23,7 +24,7 @@ class dataset_args:
 
     waifuc_pruned_tags = [] # tags in this list will be removed from captions
     waifuc_tags_threshold = 0.5 # tags with value < threshold will be removed from captions
-    waifuc_prefix_prompt = 'Sakuma Mayu from iDOLM@STER Cinderella Girls'
+    waifuc_prefix_prompt = 'Anime artstyle. Sakuma Mayu iDOLM@STER Cinderella Girls'
 
     hf_image_field = 'image'    # name of image field in hugging face dataset
     hf_text_field = 'text'
@@ -37,6 +38,7 @@ class args:
     device='xpu'
     diffusers_cache_path = '/Data/automatic/models/Diffusers'
     diffusers_pipe_name = 'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers'
+    output_folder = f'lora_{time.time()}'
 
     resume = None #'./lora_1719158082/Mayu_LoKr_0001'
     epochs = 128
@@ -44,10 +46,11 @@ class args:
     batch_size = 1
     ckpt_every_epoch = 1
     gradient_checkpointing = True
-    random_flip = True
-    uncond_p = 0.44
-    uncond_p_t5 = 0.44
-    optimizer = 'SGD' # check utils.py create_optimizer func for supported optimizers
+    random_flip = False
+    uncond_p = 0.30
+    uncond_p_t5 = 0.30
+    sample_dropout = 0.50
+    optimizer = 'Adafactor' # check utils.py create_optimizer func for supported optimizers
 
     # Hunyuan Diffusion
     #model = 'DiT-g/2'
@@ -89,14 +92,15 @@ class args:
     # ip_noise_gamma_random_strength = None
 
     # Lora param
-    training_parts = 'lokr' # lora, lokr
-    rank = 8
-    alpha = 4
+    training_parts = 'lora' # lora, lokr
+    rank = 16
+    alpha = 1
     #target_modules = ['Wqkv', 'q_proj', 'kv_proj', 'out_proj']
     target_modules = ['time_extra_emb.pooler.q_proj', 'to_q', 'to_k', 'to_v', 'to_out.0']
     use_dora = True
     lokr_use_effective_conv2d = True
-    lokr_decompose_both = True
+    lokr_decompose_both = False
+    lokr_decompose_factor = 1
 
     ###
     latents_dtype = torch.float32

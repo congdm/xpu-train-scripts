@@ -36,22 +36,17 @@ def random_crop_image(image, target_size):
     crops_coords_top_left = (x_start, y_start)
     return image_crop, crops_coords_top_left
 
-class Item:
-    def __init__(self):
-        self.image = None
-        self.filename = None
-        self.text = None
-        self.text_t5 = None
-        self.original_size = None
-        self.target_size = None
-
-        self.encoder_hidden_states = None
-        self.text_embedding_mask = None
-        self.encoder_hidden_states_t5 = None
-        self.text_embedding_mask_t5 = None
-        self.image_meta_size = None
-
 class DatasetHunyuan(torch.utils.data.Dataset):
+    class Item:
+        def __init__(self):
+            self.image = None
+            self.filename = None
+            self.prefix_text = None
+            self.text = None
+            self.tags = None
+            self.original_size = None
+            self.target_size = None
+
     @torch.no_grad()
     def __init__(self):
         from HunyuanDiT.IndexKits.index_kits import ResolutionGroup
@@ -69,18 +64,6 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             h = int(h)
             self.ratio_list.append(w/h)
             self.buckets[str(reso)] = []
-        self.empty_str_item = Item()
-        if args.random_flip:
-            self.flip_norm = transforms.Compose([
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5], [0.5]),
-            ])
-        else:
-            self.flip_norm = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5], [0.5]),
-            ])
 
     def _find_nearest_reso(self, image_size):
         w = image_size[0]
@@ -99,23 +82,33 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         w = int(w)
         h = int(h)
         return (w, h), reso
+    
+    def _tags_consolidation(self, tags):
+        res = []
+        for i in range(len(tags)):
+            j = 0
+            eliminated = False
+            while not eliminated and j < len(tags):
+                eliminated = i != j and tags[i] in tags[j]
+                j += 1
+            if not eliminated:
+                res.append(tags[i])
+        return res       
 
     @torch.no_grad()
-    def _process_item(self, image, text, danbooru_tags = None):
+    def _process_item(self, image, text, prefix_text = '', danbooru_tags = []):
         original_size = image.size
         target_size, reso = self._find_nearest_reso(original_size)
         if target_size != original_size:
             image = resize_image(image, original_size, target_size)
         
-        item = Item()
+        item = DatasetHunyuan.Item()
         item.image = image
         item.original_size = original_size
         item.target_size = target_size
         item.text = text
-        item.text_t5 = text
-        if danbooru_tags is not None:
-            item.text = item.text + ' ' + danbooru_tags
-            item.text_t5 = item.text_t5 + ' ' + danbooru_tags
+        item.prefix_text = prefix_text
+        item.tags = self._tags_consolidation(danbooru_tags)
         self.buckets[reso].append(item)
         return item
 
@@ -134,7 +127,10 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         self.save_to_pt(hf_dataset)
 
     @torch.no_grad()
-    def load_from_waifuc_local(self, dataset_dir, dataset_name, prompt_prefix, pruned_tags=[], use_florence=False):
+    def load_from_waifuc_local(
+        self, dataset_dir, dataset_name, prompt_prefix,
+        pruned_tags=[], tags_threshold=0.5, use_florence=False
+    ):
         print(f'Processing dataset {dataset_name}...')
         from waifuc.source import LocalSource
         from waifuc.action import ModeConvertAction
@@ -143,20 +139,13 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             ModeConvertAction(mode='RGB', force_background='white'),
         ) 
         for item in source:
-            text = f'{prompt_prefix}'
-            if not use_florence:
-                danbooru_tags = ''
-                if len(item.meta['tags']) > 0:
-                    tags = item.meta['tags']
-                    for k in tags.keys():
-                        if tags[k] >= dataset_args.waifuc_tags_threshold:
-                            if k not in dataset_args.waifuc_pruned_tags:
-                                danbooru_tags = danbooru_tags + k + ' '
-                if danbooru_tags == '':
-                    danbooru_tags = None
-            else:
-                danbooru_tags = None
-            self_item = self._process_item(item.image, text, danbooru_tags)
+            danbooru_tags = []
+            if len(item.meta['tags']) > 0:
+                tags = item.meta['tags']
+                for k in tags.keys():
+                    if tags[k] >= tags_threshold and k not in pruned_tags:
+                        danbooru_tags.append(k)
+            self_item = self._process_item(item.image, '', prompt_prefix, danbooru_tags)
             self_item.filename = item.meta['filename']
         if use_florence:
             self._create_florence_captions()
@@ -167,7 +156,6 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             results = florenceCaption.get_caption_for(batch, detail_level=2)
             for i in range(len(results)):
                 batch_items[i].text = batch_items[i].text + '. ' + results[i]
-                batch_items[i].text_t5 = batch_items[i].text_t5 + '. ' + results[i]
                 if dataset_args.florence_print_to_screen:
                     print('')
                     print(batch_items[i].filename)
@@ -214,6 +202,106 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         if dataset_args.use_florence_caption:
             prefix = prefix + '_florence'
         self.buckets = torch.load(f'{prefix}_cached.pt')
+    
+    @torch.no_grad()
+    def organize_into_batches(self):
+        self.idx_list = {}
+        self.batch_list = []
+        self.num_batches = 0
+        for reso in self.resolutions:
+            reso = str(reso)
+            n = len(self.buckets[reso])
+            self.idx_list[reso] = list(range(n))
+            nb = n // args.batch_size
+            if n % args.batch_size != 0:
+                nb = nb+1
+            for i in range(nb):
+                self.batch_list.append((reso, i))
+            self.num_batches += nb
+
+    # @torch.no_grad()
+    # def shuffle(self):
+    #     for reso in self.resolutions:
+    #         reso = str(reso)
+    #         random.shuffle(self.idx_list[reso])
+    #     random.shuffle(self.batch_list)
+
+    # @torch.no_grad()
+    # def _append_item_to_batch(self, batch, reso, idx):
+    #     batch.latents.append(self.buckets[reso][idx].latents)
+    #     batch.encoder_hidden_states.append(self.buckets[reso][idx].encoder_hidden_states)
+    #     batch.text_embedding_mask.append(self.buckets[reso][idx].text_embedding_mask)
+    #     batch.encoder_hidden_states_t5.append(self.buckets[reso][idx].encoder_hidden_states_t5)
+    #     batch.text_embedding_mask_t5.append(self.buckets[reso][idx].text_embedding_mask_t5)
+    #     batch.image_meta_size.append(self.buckets[reso][idx].image_meta_size)
+
+    # @torch.no_grad()
+    # def get_batch(self, idx):
+    #     if random.random() >= args.sample_dropout:
+    #         reso, i = self.batch_list[idx]
+    #         batch = lambda: None
+    #         batch.latents = []
+    #         batch.encoder_hidden_states = []
+    #         batch.text_embedding_mask = []
+    #         batch.encoder_hidden_states_t5 = []
+    #         batch.text_embedding_mask_t5 = []
+    #         batch.image_meta_size = []
+
+    #         bucket_len = len(self.idx_list[reso])
+    #         for j in range(i, i+args.batch_size):
+    #             self._append_item_to_batch(batch, reso, self.idx_list[reso][j % bucket_len])
+
+    #         batch.latents = torch.stack(batch.latents)
+    #         batch.encoder_hidden_states = torch.stack(batch.encoder_hidden_states)
+    #         batch.text_embedding_mask = torch.stack(batch.text_embedding_mask)
+    #         batch.encoder_hidden_states_t5 = torch.stack(batch.encoder_hidden_states_t5)
+    #         batch.text_embedding_mask_t5 = torch.stack(batch.text_embedding_mask_t5)
+    #         batch.image_meta_size = torch.stack(batch.image_meta_size)
+
+    #         results = (batch.latents,
+    #             batch.encoder_hidden_states, batch.text_embedding_mask,
+    #             batch.encoder_hidden_states_t5, batch.text_embedding_mask_t5,
+    #             batch.image_meta_size, reso
+    #         )
+    #     else:
+    #         results = (1.0)
+    #     return results
+
+    @torch.no_grad()
+    def print_buckets_info(self):
+        for k in self.idx_list:
+            print(f'{k}:  {len(self.idx_list[k])} images')
+
+    def __len__(self):
+        res = 0
+        for reso in self.resolutions:
+            reso = str(reso)
+            res = res + len(self.buckets[reso])
+        return res
+
+    def __getitem__(self, idx):       
+        reso, idx = self.batch_list[idx]
+        return self.buckets[reso][idx]
+    
+class DataEncoderHunyuan():
+    def __init__(self, vae, text_encoder, tokenizer, text_encoder_t5, tokenizer_t5):
+        self.vae = vae
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
+        self.text_encoder_t5 = text_encoder_t5
+        self.tokenizer_t5 = tokenizer_t5
+        self.text_ctx_len = 77
+        self.text_ctx_len_t5 = 256
+
+        self._flip_norm = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+        ])
+        self._norm = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+        ])
 
     @torch.no_grad()
     def fill_t5_token_mask(self, fill_tensor, fill_number, setting_length):
@@ -253,40 +341,30 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         return text_input_ids, attention_mask
     
     @torch.no_grad()
-    def _encode_latents_item(self, item, vae):
-        if item.target_size != item.image.size:
-            image, crops_coords_top_left = random_crop_image(
-                item.image, item.target_size
-            )
+    def _encode_latents_item(self, item):
+        if args.random_flip:
+            image = self._flip_norm(item.image)
         else:
-            image = item.image
-            crops_coords_top_left = (0, 0)
-        image = self.flip_norm(image)
+            image = self._norm(item.image)
         image = image.unsqueeze(0).to(device=device, dtype=torch.float16)
-        vae_scaling_factor = vae.config.scaling_factor
-        latents = vae.encode(image).latent_dist.sample().mul_(vae_scaling_factor)
+        vae_scaling_factor = self.vae.config.scaling_factor
+        latents = self.vae.encode(image).latent_dist.sample().mul_(vae_scaling_factor)
         item.latents = latents.cpu().squeeze(0)
-        
-        item.image_meta_size = torch.tensor(
-            [
-                item.original_size[0], item.original_size[1],
-                item.target_size[0], item.target_size[1],
-                crops_coords_top_left[0], crops_coords_top_left[1]
-            ],
-            dtype=args.inputs_dtype
-        )
+
+        # reverse = vae.decode(latents / vae_scaling_factor, return_dict=False)[0]
+        # reverse = (reverse / 2 + 0.5).clamp(0, 1)
+        # reverse = transforms.ToPILImage()(reverse[0])
+        # reverse.save(f'./debug/{item.filename}')
     
     @torch.no_grad()
-    def encode_latents(self, vae):
+    def encode_latents(self, data):
         # vae.to(device=device, dtype=args.latents_dtype)
-        vae.to(device=device, dtype=torch.float16)
-        with tqdm(total=self.__len__()) as pbar:
-            for reso in self.buckets:
-                bucket = self.buckets[reso]
-                for item in bucket:
-                    self._encode_latents_item(item, vae)
-                    pbar.update(1)
-        vae.cpu()
+        self.vae.to(device=device, dtype=torch.float16)
+        with tqdm(total=len(data)) as pbar:
+            for item in data:
+                self._encode_latents_item(item)
+                pbar.update(1)
+        self.vae.cpu()
 
     @torch.no_grad()
     def _encode_text_embeds_item(self, item):
@@ -314,120 +392,143 @@ class DatasetHunyuan(torch.utils.data.Dataset):
         item.text_embedding_mask_t5 = text_embedding_mask_t5.cpu().squeeze(0)
 
     @torch.no_grad()
-    def encode_text_embeds(self, text_encoder, tokenizer, text_encoder_t5, tokenizer_t5):
-        text_encoder.to(device=device)
-        text_encoder_t5.to(device=device, dtype=torch.float16)  # T5 Encoder always in FP16
-        self.text_encoder = text_encoder
-        self.tokenizer = tokenizer
-        self.text_encoder_t5 = text_encoder_t5
-        self.tokenizer_t5 = tokenizer_t5
-        self.text_ctx_len_t5 = 256
-        self.text_ctx_len = 77
-        with tqdm(total=self.__len__()) as pbar:
-            for reso in self.buckets:
-                bucket = self.buckets[reso]
-                for item in bucket:
-                    self._encode_text_embeds_item(item)
-                    pbar.update(1)
-        self.empty_str_item.text = ''
-        self.empty_str_item.text_t5 = ''
-        self._encode_text_embeds_item(self.empty_str_item)
-        text_encoder.cpu()
-        text_encoder_t5.cpu()
-        del self.text_encoder
-        del self.tokenizer
-        del self.text_encoder_t5
-        del self.tokenizer_t5
+    def encode_text_embeds(self, data, empty_str_item):
+        self.text_encoder.to(device=device, dtype=torch.float16)    # Bert Encoder in FP16
+        self.text_encoder_t5.to(device=device, dtype=torch.float16)  # T5 Encoder always in FP16
+        with tqdm(total=len(data)) as pbar:
+            for item in data:
+                self._encode_text_embeds_item(item)
+                pbar.update(1)
+        empty_str_item.text = ''
+        empty_str_item.text_t5 = ''
+        self._encode_text_embeds_item(empty_str_item)
+        self.text_encoder.cpu()
+        self.text_encoder_t5.cpu()
     
-    @torch.no_grad()
-    def organize_into_batches(self):
-        self.idx_list = {}
-        self.batch_list = []
-        self.num_batches = 0
-        for reso in self.resolutions:
-            reso = str(reso)
-            n = len(self.buckets[reso])
-            self.idx_list[reso] = list(range(n))
-            nb = n // args.batch_size
-            if n % args.batch_size != 0:
-                nb = nb+1
-            for i in range(nb):
-                self.batch_list.append((reso, i))
-            self.num_batches += nb
+class TrainingDatasetHunyuan(torch.utils.data.Dataset):
+    class Item:
+        def __init__(self):
+            self.image = None
+            self.filename = None
+            self.text = None
+            self.text_t5 = None
 
-    @torch.no_grad()
-    def shuffle(self):
-        for reso in self.resolutions:
-            reso = str(reso)
-            random.shuffle(self.idx_list[reso])
-        random.shuffle(self.batch_list)
+            self.latents = None
+            self.encoder_hidden_states = None
+            self.text_embedding_mask = None
+            self.encoder_hidden_states_t5 = None
+            self.text_embedding_mask_t5 = None
+            self.image_meta_size = None
 
-    @torch.no_grad()
-    def _append_item_to_batch(self, batch, reso, idx):
-        batch.latents.append(self.buckets[reso][idx].latents)
-        batch.encoder_hidden_states.append(self.buckets[reso][idx].encoder_hidden_states)
-        batch.text_embedding_mask.append(self.buckets[reso][idx].text_embedding_mask)
-        batch.encoder_hidden_states_t5.append(self.buckets[reso][idx].encoder_hidden_states_t5)
-        batch.text_embedding_mask_t5.append(self.buckets[reso][idx].text_embedding_mask_t5)
-        batch.image_meta_size.append(self.buckets[reso][idx].image_meta_size)
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self._data = [[],[]]
+        self._current = 0
+        self.empty_str_item = TrainingDatasetHunyuan.Item()
 
-    @torch.no_grad()
-    def get_batch(self, idx):
-        reso, i = self.batch_list[idx]
-        batch = lambda: None
-        batch.latents = []
-        batch.encoder_hidden_states = []
-        batch.text_embedding_mask = []
-        batch.encoder_hidden_states_t5 = []
-        batch.text_embedding_mask_t5 = []
-        batch.image_meta_size = []
+    def populate_data_from_base(self, data):
+        data.clear()
+        for x in self.base_dataset:
+            if random.random() >= args.sample_dropout:
+                item = TrainingDatasetHunyuan.Item()
+                item.image, item.image_meta_size = self._process_image_of_item(x)
+                item.filename = x.filename
+                text: str
+                text = x.prefix_text
+                if x.text != '':
+                    if text != '':
+                        text = text + ' ' + x.text
+                    else:
+                        text = x.text
+                if len(x.tags) > 0:
+                    idx = list(range(len(x.tags)))
+                    random.shuffle(idx)
+                    for i in idx:
+                        if text != '':
+                            text = text + ' ' + x.tags[i]
+                        else:
+                            text = x.tags[i]
+                item.text = text
+                item.text_t5 = text
+                data.append(item)
 
-        bucket_len = len(self.idx_list[reso])
-        for j in range(i, i+args.batch_size):
-            self._append_item_to_batch(batch, reso, self.idx_list[reso][j % bucket_len])
-
-        batch.latents = torch.stack(batch.latents)
-        batch.encoder_hidden_states = torch.stack(batch.encoder_hidden_states)
-        batch.text_embedding_mask = torch.stack(batch.text_embedding_mask)
-        batch.encoder_hidden_states_t5 = torch.stack(batch.encoder_hidden_states_t5)
-        batch.text_embedding_mask_t5 = torch.stack(batch.text_embedding_mask_t5)
-        batch.image_meta_size = torch.stack(batch.image_meta_size)
-
-        return (batch.latents,
-            batch.encoder_hidden_states, batch.text_embedding_mask,
-            batch.encoder_hidden_states_t5, batch.text_embedding_mask_t5,
-            batch.image_meta_size, reso
+    def _process_image_of_item(self, x: DatasetHunyuan.Item):
+        image = resize_image(x.image, x.original_size, x.target_size)
+        if x.target_size != image.size:
+            image, crops_coords_top_left = random_crop_image(
+                image, x.target_size
+            )
+        else:
+            crops_coords_top_left = (0, 0)
+        image_meta_size = torch.tensor(
+            [
+                x.original_size[0], x.original_size[1],
+                x.target_size[0], x.target_size[1],
+                crops_coords_top_left[0], crops_coords_top_left[1]
+            ],
+            dtype=args.inputs_dtype
         )
+        return image, image_meta_size
+    
+    def populate_data_with_florence(self, data, assist_level=1):
+        data.clear()
+        for x in self.base_dataset:
+            if random.random() >= args.sample_dropout:
+                item = TrainingDatasetHunyuan.Item()
+                item.image, item.image_meta_size = self._process_image_of_item(x)
+                item.filename = x.filename
 
-    @torch.no_grad()
-    def print_buckets_info(self):
-        for k in self.idx_list:
-            print(f'{k}:  {len(self.idx_list[k])} images')
+                # Detect human face
+
+                text: str
+                text = x.prefix_text
+                if x.text != '':
+                    if text != '':
+                        text = text + ' ' + x.text
+                    else:
+                        text = x.text
+                if len(x.tags) > 0:
+                    idx = range(len(x.tags))
+                    random.shuffle(idx)
+                    for i in idx:
+                        if text != '':
+                            text = text + ' ' + x.tags[i]
+                        else:
+                            text = x.tags[i]
+                item.text = text
+                item.text_t5 = text
+                data.append(item)
+
+    def encode_latents(self, encoder: DataEncoderHunyuan):
+        encoder.encode_latents(self._data[self._current])
+
+    def encode_text_embeds(self, encoder: DataEncoderHunyuan):
+        encoder.encode_text_embeds(self._data[self._current], self.empty_str_item)
+
+    def populate_samples(self):
+        self.populate_data_from_base(self._data[self._current])
 
     def __len__(self):
-        res = 0
-        for reso in self.resolutions:
-            reso = str(reso)
-            res = res + len(self.buckets[reso])
-        return res
-
+        return len(self._data[self._current])
+    
     def __getitem__(self, idx):
-        reso, idx = self.batch_list[idx]
+        data = self._data[self._current]     
         if random.random() < args.uncond_p:
             encoder_hidden_states = self.empty_str_item.encoder_hidden_states
             text_embedding_mask = self.empty_str_item.text_embedding_mask
         else:
-            encoder_hidden_states = self.buckets[reso][idx].encoder_hidden_states
-            text_embedding_mask = self.buckets[reso][idx].text_embedding_mask
+            encoder_hidden_states = data[idx].encoder_hidden_states
+            text_embedding_mask = data[idx].text_embedding_mask
         if random.random() < args.uncond_p_t5:
             encoder_hidden_states_t5 = self.empty_str_item.encoder_hidden_states_t5
             text_embedding_mask_t5 = self.empty_str_item.text_embedding_mask_t5
         else:
-            encoder_hidden_states_t5 = self.buckets[reso][idx].encoder_hidden_states_t5
-            text_embedding_mask_t5 = self.buckets[reso][idx].text_embedding_mask_t5
-        return (
-            self.buckets[reso][idx].latents,
+            encoder_hidden_states_t5 = data[idx].encoder_hidden_states_t5
+            text_embedding_mask_t5 = data[idx].text_embedding_mask_t5
+        results = (
+            data[idx].latents,
             encoder_hidden_states, text_embedding_mask,
             encoder_hidden_states_t5, text_embedding_mask_t5,
-            self.buckets[reso][idx].image_meta_size,
+            data[idx].image_meta_size,
         )
+        return results
