@@ -6,8 +6,6 @@ from transformers.dynamic_module_utils import get_imports
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForCausalLM
 
-from config import args
-
 def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
     """Work around for https://huggingface.co/microsoft/phi-1_5/discussions/72."""
     if not str(filename).endswith("modeling_florence2.py"):
@@ -18,7 +16,7 @@ def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
 
 class FlorenceCaption:
     @torch.no_grad()
-    def __init__(self, device):
+    def __init__(self, device='cpu'):
         with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
             self.model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True, cache_dir='.')
             self.processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True, cache_dir='.')
@@ -49,4 +47,4 @@ class FlorenceCaption:
             )
             parsed_answer = parsed_answer[prompt[i]].replace('<pad>','')
             result.append(parsed_answer)
-        return result
+        return result       

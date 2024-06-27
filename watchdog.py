@@ -17,13 +17,14 @@ def check_last_success_epoch(output_folder, LORA_NAME, epochs):
 
 def main():
     epochs = 128
-    output_folder = 'output'
+    output_folder = 'output2'
     LORA_NAME = 'Mayu_lora'
     epoch, resume = check_last_success_epoch(output_folder, LORA_NAME, epochs)
     while epoch < epochs:
         command = [
             'python', 'train_hunyuan.py',
             '--output-folder', output_folder,
+            '--log-dir', f'./runs/{LORA_NAME}_{output_folder}'
         ]
         if resume is not None:
             command.append('--resume')

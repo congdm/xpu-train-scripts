@@ -1,14 +1,12 @@
 import random
 
 import torch
-import intel_extension_for_pytorch as ipex
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 from datasets import load_dataset
 
 from config import args
-from config import dataset_args
 import florence
 device = args.device
 
@@ -35,6 +33,22 @@ def random_crop_image(image, target_size):
     image_crop = image.crop((x_start, y_start, x_start + target_size[0], y_start + target_size[1]))
     crops_coords_top_left = (x_start, y_start)
     return image_crop, crops_coords_top_left
+
+def resize_and_random_crop(img, original_size, target_size):
+    image = resize_image(img, original_size, target_size)
+    if target_size != image.size:
+        image, crops_coords_top_left = random_crop_image(image, target_size)
+    else:
+        crops_coords_top_left = (0, 0)
+    image_meta_size = torch.tensor(
+        [
+            original_size[0], original_size[1],
+            target_size[0], target_size[1],
+            crops_coords_top_left[0], crops_coords_top_left[1]
+        ],
+        dtype=args.inputs_dtype
+    )
+    return image, image_meta_size
 
 class DatasetHunyuan(torch.utils.data.Dataset):
     class Item:
@@ -64,6 +78,10 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             h = int(h)
             self.ratio_list.append(w/h)
             self.buckets[str(reso)] = []
+
+    def _clear(self):
+        for reso in self.resolutions:
+            self.buckets[str(reso)].clear()
 
     def _find_nearest_reso(self, image_size):
         w = image_size[0]
@@ -156,12 +174,12 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             results = florenceCaption.get_caption_for(batch, detail_level=2)
             for i in range(len(results)):
                 batch_items[i].text = batch_items[i].text + '. ' + results[i]
-                if dataset_args.florence_print_to_screen:
+                if args.dataset.florence_print_to_screen:
                     print('')
                     print(batch_items[i].filename)
                     print(results[i])
         print('Creating captions for dataset with Florence...')
-        if dataset_args.florence_use_cpu:
+        if args.dataset.florence_use_cpu:
             florenceCaption = florence.FlorenceCaption('cpu')
         else:
             florenceCaption = florence.FlorenceCaption(args.device)
@@ -169,7 +187,7 @@ class DatasetHunyuan(torch.utils.data.Dataset):
             for reso in self.buckets:
                 batch = []
                 batch_items = []
-                batch_size = dataset_args.florence_batch_size
+                batch_size = args.dataset.florence_batch_size
                 for item in self.buckets[reso]:
                     if len(batch) >= batch_size:
                         _process_batch(florenceCaption, batch, batch_items)
@@ -192,14 +210,14 @@ class DatasetHunyuan(torch.utils.data.Dataset):
 
     @torch.no_grad()
     def save_to_pt(self, prefix):
-        if dataset_args.use_florence_caption:
+        if args.dataset.use_florence_caption:
             prefix = prefix + '_florence'
         self._print_captions_to_file(prefix)
         torch.save(self.buckets, f'{prefix}_cached.pt')
 
     @torch.no_grad()
     def load_from_pt(self, prefix):
-        if dataset_args.use_florence_caption:
+        if args.dataset.use_florence_caption:
             prefix = prefix + '_florence'
         self.buckets = torch.load(f'{prefix}_cached.pt')
     
@@ -431,7 +449,9 @@ class TrainingDatasetHunyuan(torch.utils.data.Dataset):
         for x in self.base_dataset:
             if random.random() >= args.sample_dropout:
                 item = TrainingDatasetHunyuan.Item()
-                item.image, item.image_meta_size = self._process_image_of_item(x)
+                item.image, item.image_meta_size = resize_and_random_crop(
+                    x.image, x.original_size, x.target_size
+                )
                 item.filename = x.filename
                 text: str
                 text = x.prefix_text
@@ -445,54 +465,7 @@ class TrainingDatasetHunyuan(torch.utils.data.Dataset):
                     random.shuffle(idx)
                     for i in idx:
                         if text != '':
-                            text = text + ' ' + x.tags[i]
-                        else:
-                            text = x.tags[i]
-                item.text = text
-                item.text_t5 = text
-                data.append(item)
-
-    def _process_image_of_item(self, x: DatasetHunyuan.Item):
-        image = resize_image(x.image, x.original_size, x.target_size)
-        if x.target_size != image.size:
-            image, crops_coords_top_left = random_crop_image(
-                image, x.target_size
-            )
-        else:
-            crops_coords_top_left = (0, 0)
-        image_meta_size = torch.tensor(
-            [
-                x.original_size[0], x.original_size[1],
-                x.target_size[0], x.target_size[1],
-                crops_coords_top_left[0], crops_coords_top_left[1]
-            ],
-            dtype=args.inputs_dtype
-        )
-        return image, image_meta_size
-    
-    def populate_data_with_florence(self, data, assist_level=1):
-        data.clear()
-        for x in self.base_dataset:
-            if random.random() >= args.sample_dropout:
-                item = TrainingDatasetHunyuan.Item()
-                item.image, item.image_meta_size = self._process_image_of_item(x)
-                item.filename = x.filename
-
-                # Detect human face
-
-                text: str
-                text = x.prefix_text
-                if x.text != '':
-                    if text != '':
-                        text = text + ' ' + x.text
-                    else:
-                        text = x.text
-                if len(x.tags) > 0:
-                    idx = range(len(x.tags))
-                    random.shuffle(idx)
-                    for i in idx:
-                        if text != '':
-                            text = text + ' ' + x.tags[i]
+                            text = text + ',' + x.tags[i]
                         else:
                             text = x.tags[i]
                 item.text = text
@@ -507,6 +480,15 @@ class TrainingDatasetHunyuan(torch.utils.data.Dataset):
 
     def populate_samples(self):
         self.populate_data_from_base(self._data[self._current])
+
+    def _current_data(self):
+        return self._data[self._current]
+    
+    def _other_data(self):
+        return self._data[(self._current + 1) % 2]
+    
+    def _switch_data(self):
+        self._current = (self._current + 1) % 2
 
     def __len__(self):
         return len(self._data[self._current])

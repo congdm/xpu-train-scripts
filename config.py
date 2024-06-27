@@ -1,46 +1,59 @@
-from enum import Enum
 import time
 import torch
 
-class DatasetType(Enum):
-    WAIFUC_LOCAL = 1
-    HUGGING_FACE = 2
-    IMG_AND_TXT_LOCAL = 3
-
-class opt_args:
-    # check utils.py for params used by optimizer
-    lr = 5e-5
-    weight_decay = 0.0
-    momentum=0.9
-    relative_step=False
-    scale_parameter=True
-    warmup_init=True
-
-class dataset_args:
-    type = DatasetType.WAIFUC_LOCAL
-    name = 'sakuma_mayu'
-    localdir = './mayu_dataset-raw' # if dataset is from local source
-    load_dataset_from_cached_files = False
-
-    waifuc_pruned_tags = [] # tags in this list will be removed from captions
-    waifuc_tags_threshold = 0.5 # tags with value < threshold will be removed from captions
-    waifuc_prefix_prompt = 'Anime artstyle. Sakuma Mayu iDOLM@STER Cinderella Girls'
-
-    hf_image_field = 'image'    # name of image field in hugging face dataset
-    hf_text_field = 'text'
-
-    use_florence_caption = False
-    florence_use_cpu = True # running florence on XPU can give garbaged results
-    florence_batch_size = 4
-    florence_print_to_screen = False    # print to screen to check results during processing
+from constants import DatasetType
 
 class args:
     device='xpu'
     diffusers_cache_path = '/Data/automatic/models/Diffusers'
     diffusers_pipe_name = 'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers'
-    output_folder = f'lora_{time.time()}'
+    LORA_NAME = 'Mayu'
+    output_folder = f'{LORA_NAME}_lora_{time.time()}'
+    tensorboard_logdir = f'./runs/{LORA_NAME}-{time.time()}'
 
-    resume = None #'./lora_1719158082/Mayu_LoKr_0001'
+    class dataset:
+        type = DatasetType.WAIFUC_LOCAL
+        name = 'sakuma_mayu'
+        localdir = './mayu_dataset-raw' # if dataset is from local source
+        load_dataset_from_cached_files = True
+
+        waifuc_pruned_tags = ['1girl', 'solo'] # tags in this list will be removed from captions
+        waifuc_tags_threshold = 0.5 # tags with value < threshold will be removed from captions
+        waifuc_prefix_prompt = 'Sakuma Mayu iDOLM@STER Cinderella Girls.'
+
+        hf_image_field = 'image'    # name of image field in hugging face dataset
+        hf_text_field = 'text'
+
+        use_florence_caption = False
+        florence_use_cpu = True # running florence on XPU can give garbaged results
+        florence_batch_size = 4
+        florence_print_to_screen = False    # print to screen to check results during processing
+
+    class opt:
+        name = 'CAME'
+        class CAME:
+            lr = 1e-5
+            weight_decay = 0.01
+            beta1 = 0.9
+            beta2 = 0.999
+            beta3 = 0.9998
+            eps = (1e-30, 1e-16)
+        class AdamW:
+            lr = 1e-5
+            weight_decay = 0.01
+        class Adafactor:
+            lr = 1e-4
+            weight_decay = 0.01
+            relative_step=True
+            scale_parameter=True
+            warmup_init=True
+        class SGD:
+            lr = 1e-4
+            weight_decay = 0.01
+            momentum=0.9
+            nesterov=True
+
+    resume = None
     epochs = 128
     grad_accu_steps = 2
     batch_size = 1
@@ -50,7 +63,6 @@ class args:
     uncond_p = 0.30
     uncond_p_t5 = 0.30
     sample_dropout = 0.50
-    optimizer = 'Adafactor' # check utils.py create_optimizer func for supported optimizers
 
     # Hunyuan Diffusion
     #model = 'DiT-g/2'
@@ -73,7 +85,7 @@ class args:
     mse_loss_weight_type = 'min_snr_5' # 'min_snr_5', 'constant'
     beta_start = 0.00085
     beta_end = 0.03
-    noise_offset = 0.05
+    noise_offset = 0.01
 
     # pipeline = 'KohyaPipeline'
     # noise_schedule = 'scaled_linear'
@@ -106,4 +118,3 @@ class args:
     latents_dtype = torch.float32
     inputs_dtype = torch.float32
     models_dtype = torch.float32
-
